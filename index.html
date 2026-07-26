@@ -1534,7 +1534,7 @@ const Net = {
   ready:false, err:'', uid:null, db:null,
   on:false, role:null, myTeam:1, code:null,
   roomRef:null, refs:[], status:'', foeDeck:null, foeSeen:0,
-  desync:false, foeLeft:false, lastSyncTick:0, sums:{}, seed:0,
+  desync:false, foeLeft:false, foeForfeit:false, lastSyncTick:0, sums:{}, seed:0,
   searching:false, queueRef:null,
 };
 function netAvailable(){ return typeof firebase!=='undefined' && firebase && firebase.initializeApp; }
@@ -1566,12 +1566,15 @@ function netCleanup(){
   Net.refs=[];
   if(Net.queueRef){ try{ Net.queueRef.remove(); }catch(e){} Net.queueRef=null; }
 }
+function netAnnounceQuit(){
+  if(Net.roomRef&&Net.uid){ try{ Net.roomRef.child('players/'+Net.uid).update({gone:true,forfeit:true}); }catch(e){} }
+}
 function netLeave(quiet){
   netCleanup();
   if(Net.roomRef && Net.uid && !quiet){
     try{ Net.roomRef.child('players/'+Net.uid+'/gone').set(true); }catch(e){}
   }
-  Net.on=false; Net.role=null; Net.code=null; Net.roomRef=null;
+  Net.on=false; Net.role=null; Net.code=null; Net.roomRef=null; Net.foeForfeit=false;
   Net.myTeam=1; Net.desync=false; Net.foeLeft=false; Net.foeDeck=null;
   Net.searching=false; Net.sums={}; Net.status='';
 }
@@ -1598,6 +1601,8 @@ function netHost(){
 }
 function netJoin(code){
   Net.status='Joining '+code+'…';
+  Net.searching=false;
+  netCleanup();
   netInit(err=>{
     if(err){ Net.status=err; return; }
     const ref=Net.db.ref('rooms/'+code);
@@ -1628,7 +1633,11 @@ function netWatchRoom(){
     const others=Object.keys(p).filter(k=>k!==Net.uid);
     if(!others.length) return;
     const foe=p[others[0]];
-    if(foe.gone){ if(Net.on) Net.foeLeft=true; else { Net.status='Opponent left'; } return; }
+    if(foe.gone){
+      if(Net.on){ Net.foeLeft=true; if(foe.forfeit) Net.foeForfeit=true; }
+      else Net.status='Opponent left';
+      return;
+    }
     if(foe.deck) Net.foeDeck=foe.deck;
     if(!Net.on && Net.foeDeck) netBegin();
   });
@@ -1645,6 +1654,7 @@ function netWatchRoom(){
   });
 }
 function netBegin(){
+  if(Net.queueRef){ try{Net.queueRef.remove();}catch(e){} Net.queueRef=null; }
   Net.on=true; Net.desync=false; Net.foeLeft=false; Net.sums={};
   INPUT_DELAY=NET_DELAY_TICKS;
   Net.status='';
@@ -1661,14 +1671,22 @@ function netQuick(){
     Net.queueRef=qref;
     qref.set({t:Date.now(), deck:stats.deck});
     qref.onDisconnect().remove();
-    netTrack(qref,'value',snap=>{                       // someone paired with me
-      const v=snap.val();
-      if(v&&v.room){ const code=v.room; qref.remove(); Net.queueRef=null; netJoin(code); }
-    });
     netTrack(Net.db.ref('queue'),'value',snap=>{
       if(!Net.searching||Net.on) return;
-      const q=snap.val()||{};
-      const others=Object.keys(q).filter(k=>k!==Net.uid&&!q[k].room);
+      const q=snap.val()||{}, nowMs=Date.now();
+      const fresh=k=>q[k]&&q[k].t&&(nowMs-q[k].t)<60000;      // ignore abandoned tickets
+      // (a) has someone already paired with me? their own node carries the code
+      for(const k in q){
+        if(k!==Net.uid && fresh(k) && q[k].pair===Net.uid && q[k].room){
+          Net.searching=false;
+          const code=q[k].room;
+          if(Net.queueRef){ Net.queueRef.remove(); Net.queueRef=null; }
+          netJoin(code);
+          return;
+        }
+      }
+      // (b) otherwise, should I be the host?
+      const others=Object.keys(q).filter(k=>k!==Net.uid&&fresh(k)&&!q[k].room&&!q[k].pair);
       if(!others.length) return;
       others.sort();
       const foeUid=others[0];
@@ -1683,10 +1701,14 @@ function netQuick(){
           players:{ [Net.uid]:{ role:'host', deck:stats.deck, ts:Date.now() } }
         }).then(()=>{
           Net.roomRef.child('players/'+Net.uid).onDisconnect().update({gone:true});
-          Net.db.ref('queue/'+foeUid+'/room').set(code);
-          if(Net.queueRef){ Net.queueRef.remove(); Net.queueRef=null; }
+          // advertise on MY OWN ticket — writing the opponent's node is denied by rules
+          return qref.update({room:code, pair:foeUid, t:Date.now()});
+        }).then(()=>{
           Net.status='Opponent found…'; state='netroom'; netWatchRoom();
-        }).catch(e=>{ Net.status='Match failed: '+(e.code||e.message); Net.searching=true; });
+        }).catch(e=>{
+          Net.status='Match failed: '+(e.code||e.message);
+          Net.searching=true; Net.roomRef=null;
+        });
       }
     });
   });
@@ -1711,7 +1733,9 @@ function netUpdate(dt){
   netTickSync();
   if(Net.foeLeft && state==='playing'){
     Net.foeGrace=(Net.foeGrace||0)+dt*1000;
-    if(Net.foeGrace>GRACE_MS){ Net.foeGrace=0; endMatch(Net.myTeam===1?'victory':'defeat'); }
+    if(Net.foeForfeit || Net.foeGrace>GRACE_MS){
+      Net.foeGrace=0; endMatch(Net.myTeam===1?'victory':'defeat');
+    }
   } else Net.foeGrace=0;
   if(Net.desync && state==='playing'){ result='desync'; recordDesync(); state='over'; netCleanup(); Net.on=false; INPUT_DELAY=0; refreshAudio(); }
 }
@@ -1834,7 +1858,12 @@ function drawNetQuit(){
   buttons=[];
   drawButton('Keep playing',W/2,H*0.57,W*0.6,H*0.07,'#3a86c4',()=>{ state='playing'; });
   drawButton('Forfeit',W/2,H*0.68,W*0.6,H*0.07,'#c8483f',()=>{
-    state='playing'; const r=MYTEAM()===1?'defeat':'victory'; netLeave(); endMatch(r); });
+    state='playing';
+    const canonical = MYTEAM()===1 ? 'defeat' : 'victory';   // I lose, expressed host-side
+    netAnnounceQuit();          // tell the opponent first, while the ref is alive
+    endMatch(canonical);        // translates correctly — Net.on is still true here
+    netLeave(true);
+  });
 }
 function drawNetBadge(){
   const w=W*0.32, h=TOP_H*0.40, x=W/2-w/2, y=TOP_H+4;
