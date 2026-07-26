@@ -20,6 +20,9 @@
 <body>
 <div id="stage"><canvas id="c"></canvas></div>
 <button id="mute" aria-label="Toggle sound">🔊</button>
+<script src="https://www.gstatic.com/firebasejs/12.16.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/12.16.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/12.16.0/firebase-database-compat.js"></script>
 <script>
 (function(){
 "use strict";
@@ -39,6 +42,7 @@ const RIVER = 14;
 const BR_L = 4, BR_R = 14;
 const BRIDGE_HALF = 0.62;             // half-width of walkable bridge deck
 const MATCH_LEN = 150, DOUBLE_AT = 40, OVERTIME = 60;
+const GAME_VERSION = '2.0';
 const STEP = 1/60;
 /* Deploy delay scales with card weight: cheap cycle cards land fast,
    heavy tanks telegraph. Per-card `deploy` overrides this fallback. */
@@ -216,13 +220,15 @@ function loadStats(){
 }
 function saveStats(){ try{ stats.difficulty=difficulty; localStorage.setItem(STORE_KEY,JSON.stringify(stats)); }catch(e){} }
 function recordResult(r){
-  const my=crownCount(1), foe=crownCount(-1);
+  if(r==='desync') return;
+  const me=MYTEAM(), my=crownCount(me), foe=crownCount(-me);
   stats.games++; stats.crowns+=my;
   if(r==='victory') stats.wins++; else if(r==='defeat') stats.losses++; else stats.draws++;
-  stats.history.unshift({r,my,foe,d:difficulty,t:Date.now()});
+  stats.history.unshift({r,my,foe,d:Net.on?'online':difficulty,t:Date.now()});
   if(stats.history.length>20) stats.history.length=20;
   saveStats();
 }
+function recordDesync(){}
 function resetStats(){
   const d=stats.deck;
   stats={wins:0,losses:0,draws:0,crowns:0,games:0,history:[],deck:d,difficulty};
@@ -231,11 +237,77 @@ function resetStats(){
 
 /* ----------------------------- HELPERS ----------------------------- */
 const clamp=(v,a,b)=>v<a?a:v>b?b:v;
-const dist=(ax,ay,bx,by)=>Math.hypot(ax-bx,ay-by);
-function shuffle(a){a=a.slice();for(let i=a.length-1;i>0;i--){const j=(Math.random()*(i+1))|0;[a[i],a[j]]=[a[j],a[i]];}return a;}
+/* ------------------- DETERMINISM CORE (netcode-ready) ---------------
+   Everything the simulation touches must be reproducible from
+   (seed + ordered command list). Cosmetic randomness deliberately
+   stays on Math.random() so it never perturbs the sim stream —
+   particles/shake/audio differ per device and that's fine.
+   ------------------------------------------------------------------- */
+let simState=1;
+function seedSim(s){ simState=(s>>>0)||1; }
+function srand(){                                   // mulberry32
+  simState=(simState+0x6D2B79F5)|0;
+  let t=Math.imul(simState^(simState>>>15), 1|simState);
+  t=(t+Math.imul(t^(t>>>7), 61|t))^t;
+  return ((t^(t>>>14))>>>0)/4294967296;
+}
+/* IEEE-754 sqrt is bit-identical across engines; Math.hypot is not. */
+const dist=(ax,ay,bx,by)=>{ const dx=ax-bx, dy=ay-by; return Math.sqrt(dx*dx+dy*dy); };
+const len2=(x,y)=>Math.sqrt(x*x+y*y);
+function shuffle(a){
+  a=a.slice();
+  for(let i=a.length-1;i>0;i--){ const j=(srand()*(i+1))|0; const t=a[i]; a[i]=a[j]; a[j]=t; }
+  return a;
+}
+
+/* ---- Lockstep command queue ----
+   No gameplay action mutates state directly. Inputs become commands
+   scheduled for a future tick, so a remote player's commands can be
+   injected the same way with zero further restructuring. */
+let tick=0, cmdQueue=[], cmdSeq=0;
+let INPUT_DELAY=0;                 // ticks; raise for online play
+function queueCommand(c){ c.seq=cmdSeq++; cmdQueue.push(c); return c; }
+function issueDeploy(team,slot,x,y){
+  return queueCommand({tick:tick+INPUT_DELAY, type:'deploy', team, slot, x, y});
+}
+function applyDueCommands(){
+  if(!cmdQueue.length) return;
+  const due=[];
+  for(let i=0;i<cmdQueue.length;i++) if(cmdQueue[i].tick<=tick) due.push(cmdQueue[i]);
+  if(!due.length) return;
+  // strict ordering so both peers execute identically
+  due.sort((a,b)=>(a.tick-b.tick)||(a.team-b.team)||(a.seq-b.seq));
+  for(const c of due) execCommand(c);
+  cmdQueue=cmdQueue.filter(c=>c.tick>tick);
+}
+function execCommand(c){
+  if(c.type!=='deploy') return;
+  const side=c.team===1?player:enemy;
+  const key=side.hand[c.slot];
+  if(!key) return;
+  const card=CARDS[key];
+  if(side.elixir<card.cost) return;          // re-validated at exec time on both peers
+  side.elixir-=card.cost;
+  const played=playFromHand(side,c.slot);
+  spawnCard(side,played,c.x,c.y);
+}
+
+/* ---- Desync detection: cheap rolling checksum of simulation state ---- */
+function stateChecksum(){
+  let h=2166136261>>>0;
+  const mix=v=>{ h=(h^(v|0))>>>0; h=Math.imul(h,16777619)>>>0; };
+  mix(tick);
+  for(let i=0;i<units.length;i++){
+    const u=units[i];
+    mix(u.id); mix(u.team); mix(u.x*512); mix(u.y*512); mix(u.hp*4); mix(u.deploy*256);
+  }
+  for(let i=0;i<towers.length;i++){ const t=towers[i]; mix(t.hp*4); mix(t.alive?1:0); }
+  mix(player.elixir*256); mix(enemy.elixir*256);
+  return h>>>0;
+}
 function sx(x){return arenaX+x*tile;}
-function sy(y){return arenaY+y*tile;}
-function toArena(px,py){return {x:(px-arenaX)/tile, y:(py-arenaY)/tile};}
+function sy(y){return arenaY+(FLIP()?(TY-y):y)*tile;}
+function toArena(px,py){const ry=(py-arenaY)/tile; return {x:(px-arenaX)/tile, y:FLIP()?(TY-ry):ry};}
 function rr(g,x,y,w,h,r){g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();}
 function shade(hex,f){
   const n=parseInt(hex.slice(1),16); let r=(n>>16)&255,g=(n>>8)&255,b=n&255;
@@ -424,11 +496,15 @@ function playFromHand(side,slot){
 }
 
 /* ------------------------------ MATCH ------------------------------ */
-function startMatch(){
+function startMatch(seed,deckA,deckB){
+  seedSim(seed!=null?seed:(Date.now()>>>0));
+  tick=0; cmdQueue=[]; cmdSeq=0;
   units=[]; projectiles=[]; rollers=[]; fx=[]; floaters=[]; towers=[]; uid=1; shake=0;
   matchTime=0; overtime=false; result=''; sel=-1; dragging=false;
-  player=makeSide(1, (Array.isArray(stats.deck)&&stats.deck.length===8)?stats.deck:DEFAULT_DECK);
-  enemy=makeSide(-1,AI_DECKS[difficulty]);
+  const dA=(Array.isArray(deckA)&&deckA.length===8)?deckA:((Array.isArray(stats.deck)&&stats.deck.length===8)?stats.deck:DEFAULT_DECK);
+  const dB=(Array.isArray(deckB)&&deckB.length===8)?deckB:AI_DECKS[difficulty];
+  player=makeSide(1,dA);
+  enemy=makeSide(-1,dB);
   for(const k in TOWERS_DEF){
     const d=TOWERS_DEF[k], st=d.king?TOWER_STATS.king:TOWER_STATS.princess;
     towers.push({key:k,x:d.x,y:d.y,team:d.team,king:d.king,
@@ -454,7 +530,7 @@ function spawnCard(side,cardKey,x,y){
       air:!!c.air, hitAir:!!c.hitAir, ranged:!!c.ranged, splash:c.splash||0, slowOnHit:c.slow||0,
       isBuilding:c.type==='building', life:c.life||0, maxLife:c.life||0,
       radius:c.radius, stun:0, slow:0, kbY:0, kbT:0, deploy:dep, maxDeploy:dep,
-      target:null, retargetCd:0, hitFlash:0, lunge:0, walk:c.type==='building'?0:Math.random()*6.28,
+      target:null, retargetCd:0, hitFlash:0, lunge:0, walk:c.type==='building'?0:srand()*6.28,
     });
   }
   S.deploy();
@@ -591,7 +667,7 @@ function pathPoint(u,t){
 function steerUnit(u,dt){
   const t=u.target; if(!t) return;
   const wp=pathPoint(u,t);
-  let dx=wp.x-u.x, dy=wp.y-u.y; const d=Math.hypot(dx,dy)||1;
+  let dx=wp.x-u.x, dy=wp.y-u.y; const d=len2(dx,dy)||1;
   let sxv=dx/d, syv=dy/d;
 
   // separation (only against same layer: ground vs ground, air vs air)
@@ -599,7 +675,7 @@ function steerUnit(u,dt){
   forEachNeighbor(u,o=>{
     if(o===u||o.dead||o.air!==u.air) return;
     const ddx=u.x-o.x, ddy=u.y-o.y;
-    const dd=Math.hypot(ddx,ddy);
+    const dd=len2(ddx,ddy);
     const mind=(u.radius+o.radius)*1.06;
     if(dd<mind && dd>0.0001){
       const w=(mind-dd)/mind*(o.isBuilding?1.7:1);
@@ -619,7 +695,7 @@ function steerUnit(u,dt){
   }
 
   let vx=sxv+sepx*1.9+fnx, vy=syv+sepy*1.9;
-  const vl=Math.hypot(vx,vy)||1; vx/=vl; vy/=vl;
+  const vl=len2(vx,vy)||1; vx/=vl; vy/=vl;
   const spd=u.speed*(u.slow>0?0.45:1);
   const turn=1-Math.exp(-11*dt);
   u.vx+=(vx*spd-u.vx)*turn;
@@ -634,7 +710,7 @@ function steerUnit(u,dt){
     }
   }
   u.x=clamp(px,0.4,TX-0.4); u.y=clamp(py,0.4,TY-0.4);
-  u.walk+=dt*Math.hypot(u.vx,u.vy)*6;
+  u.walk+=dt*len2(u.vx,u.vy)*6;
 }
 function applyKnockback(u,dt){
   u.kbT-=dt;
@@ -671,7 +747,7 @@ function dealHit(src,t,dmg){
 function updateProjectiles(dt){
   for(const p of projectiles){
     if(p.target&&!p.target.dead&&p.target.alive!==false){ p.tx=p.target.x; p.ty=p.target.y; }
-    const dx=p.tx-p.x, dy=p.ty-p.y, d=Math.hypot(dx,dy)||1, step=p.speed*dt;
+    const dx=p.tx-p.x, dy=p.ty-p.y, d=len2(dx,dy)||1, step=p.speed*dt;
     if(d<=step){ p.hit=true; impact(p); } else { p.x+=dx/d*step; p.y+=dy/d*step; }
   }
   projectiles=projectiles.filter(p=>!p.hit);
@@ -735,7 +811,7 @@ function updateFx(dt){
 }
 function updateElixir(side,dt){
   const base=(matchTime>=MATCH_LEN-DOUBLE_AT||overtime)?1/1.4:1/2.8;
-  const mul=side.team===-1?AI_LEVELS[difficulty].elixirMul:1;
+  const mul=(!Net.on && side.team===-1)?AI_LEVELS[difficulty].elixirMul:1;
   side.elixir=Math.min(10,side.elixir+base*mul*dt);
 }
 
@@ -765,14 +841,14 @@ function aiThink(dt){
   if(!pick && threat && tv>900 && has('cannon')){
     pick=has('cannon'); px=clamp(threat.x<9?6.8:11.2,2,16); py=RIVER-3.5;
   }
-  if(!pick && threat && tv>cfg.threatHp && Math.random()<cfg.defend){
+  if(!pick && threat && tv>cfg.threatHp && srand()<cfg.defend){
     for(const k of ['bomber','whirl','slings','ratlings','recruit','wisps','brute','cannon']){
       const a=has(k); if(a){ pick=a; break; } }
     if(pick){ px=clamp(threat.x,2,16); py=clamp(RIVER-2.2,5,RIVER-1); }
   }
   if(!pick && s.elixir>=cfg.pushAt){
     const g=has('golem')||has('brute');
-    if(g){ pick=g; px=Math.random()<0.5?BR_L:BR_R; py=3.5; }
+    if(g){ pick=g; px=srand()<0.5?BR_L:BR_R; py=3.5; }
   }
   if(!pick && s.elixir>=5){
     const tank=units.find(u=>u.team===-1&&!u.dead&&(u.card==='golem'||u.card==='brute'));
@@ -780,12 +856,12 @@ function aiThink(dt){
       const a=has(k); if(a){ pick=a; break; } }
     if(pick){
       if(tank){ px=clamp(tank.x,2,16); py=clamp(tank.y-1.2,3,RIVER-1); }
-      else { px=Math.random()<0.5?BR_L:BR_R; py=6.2; }
+      else { px=srand()<0.5?BR_L:BR_R; py=6.2; }
     }
   }
 
   if(pick){
-    if(cfg.mistake>0&&Math.random()<cfg.mistake) px=clamp(px+(Math.random()*4-2),1,TX-1);
+    if(cfg.mistake>0&&srand()<cfg.mistake) px=clamp(px+(srand()*4-2),1,TX-1);
     const c=CARDS[pick.k];
     if(c.type!=='spell'){
       let maxY=RIVER-0.6;
@@ -793,9 +869,8 @@ function aiThink(dt){
       if(px>=9&&!towers.find(t=>t.key==='pR').alive) maxY=RIVER+7;
       py=clamp(py,0.6,maxY); px=clamp(px,1,TX-1);
     }
-    const key=playFromHand(s,pick.i); s.elixir-=CARDS[key].cost;
-    spawnCard(s,key,px,py);
-    s.aiTimer=cfg.delayMin+Math.random()*cfg.delayRand;
+    issueDeploy(-1,pick.i,px,py);
+    s.aiTimer=cfg.delayMin+srand()*cfg.delayRand;
   } else s.aiTimer=0.5;
 }
 
@@ -820,19 +895,23 @@ function checkEnd(){
     if(pc!==ec) endMatch(pc>ec?'victory':'defeat');
   }
 }
-function endMatch(r){
+function endMatch(r){            // r is canonical (host perspective)
   if(state==='over') return;
+  if(Net.on && Net.myTeam===-1){ if(r==='victory') r='defeat'; else if(r==='defeat') r='victory'; }
   result=r; recordResult(r); state='over'; refreshAudio();
+  if(Net.on){ netCleanup(); Net.on=false; INPUT_DELAY=0; }
   if(r==='victory') S.win(); else if(r==='defeat') S.lose();
 }
 
 /* ------------------------------ UPDATE ----------------------------- */
 function update(dt){
   if(state!=='playing') return;
+  tick++;
+  applyDueCommands();
   matchTime+=dt;
   shake=Math.max(0,shake-34*dt);
   updateElixir(player,dt); updateElixir(enemy,dt);
-  aiThink(dt);
+  if(!Net.on) aiThink(dt);
   buildGrid();
 
   for(const u of units){
@@ -866,6 +945,7 @@ function update(dt){
   updateRollers(dt);
   updateTowers(dt);
   updateFx(dt);
+  netUpdate(dt);
   checkEnd();
 }
 
@@ -873,12 +953,14 @@ function update(dt){
 function render(){
   ctx.clearRect(0,0,W,H);
   ctx.fillStyle='#0d1119'; ctx.fillRect(0,0,W,H);
-  if(state==='menu'||state==='help'||state==='stats'||state==='deck'){ drawMenu(); return; }
+  if(state==='menu'||state==='help'||state==='stats'||state==='deck'||
+     state==='netmenu'||state==='netjoin'||state==='netroom'||state==='netsearch'){ drawMenu(); return; }
+  if(!player||!towers.length) return;
 
   const shx=shake?(Math.random()*2-1)*shake:0, shy=shake?(Math.random()*2-1)*shake:0;
   ctx.save(); ctx.translate(shx,shy);
   ctx.drawImage(bg,arenaX,arenaY,arenaW,arenaH);
-  if(sel>=0&&CARDS[player.hand[sel]].type!=='spell') drawDeployZone();
+  if(sel>=0&&CARDS[mySide().hand[sel]].type!=='spell') drawDeployZone();
   for(const t of towers) drawTower(t);
   const sorted=units.slice().sort((a,b)=>a.y-b.y);
   for(const u of sorted) drawUnit(u);
@@ -894,8 +976,9 @@ function render(){
     ctx.fillStyle='#ffd23c'; ctx.font=`bold ${Math.round(H*0.07)}px system-ui`; ctx.textAlign='center'; ctx.textBaseline='middle';
     ctx.fillText(f.text,W/2,arenaY+arenaH*0.4); ctx.globalAlpha=1;
   }}
-  drawTopBar(); drawHUD();
+  drawTopBar(); drawHUD(); if(Net.on) drawNetBadge();
   if(state==='paused') drawPause();
+  if(state==='netquit') drawNetQuit();
   if(state==='over') drawOver();
 }
 function drawUnit(u){
@@ -1044,24 +1127,39 @@ function drawFx(f){
 }
 function drawDeployZone(){
   ctx.save(); ctx.globalAlpha=0.10; ctx.fillStyle=COL.pRing;
-  const eLdown=!towers.find(t=>t.key==='eL').alive, eRdown=!towers.find(t=>t.key==='eR').alive;
-  ctx.fillRect(sx(0.4),sy(RIVER+0.6),arenaW-tile*0.8,sy(TY-0.4)-sy(RIVER+0.6));
-  if(eLdown) ctx.fillRect(sx(0.4),sy(0.6),arenaW/2-tile*0.4,sy(RIVER+0.6)-sy(0.6));
-  if(eRdown) ctx.fillRect(sx(9),sy(0.6),arenaW/2-tile*0.4,sy(RIVER+0.6)-sy(0.6));
+  const me=MYTEAM();
+  const band=(y0,y1,x0,w)=>{ const a=sy(y0),b=sy(y1); ctx.fillRect(x0,Math.min(a,b),w,Math.abs(b-a)); };
+  if(me===1){
+    band(RIVER+0.6,TY-0.4,sx(0.4),arenaW-tile*0.8);
+    if(!towers.find(t=>t.key==='eL').alive) band(0.6,RIVER+0.6,sx(0.4),arenaW/2-tile*0.4);
+    if(!towers.find(t=>t.key==='eR').alive) band(0.6,RIVER+0.6,sx(9),arenaW/2-tile*0.4);
+  } else {
+    band(0.4,RIVER-0.6,sx(0.4),arenaW-tile*0.8);
+    if(!towers.find(t=>t.key==='pL').alive) band(RIVER-0.6,TY-0.6,sx(0.4),arenaW/2-tile*0.4);
+    if(!towers.find(t=>t.key==='pR').alive) band(RIVER-0.6,TY-0.6,sx(9),arenaW/2-tile*0.4);
+  }
   ctx.restore();
 }
 function isValidDeploy(x,y,c){
   if(x<0.6||x>TX-0.6||y<0.6||y>TY-0.6) return false;
   if(c.type==='spell') return true;
-  if(y>RIVER+0.5) return true;
-  const eLdown=!towers.find(t=>t.key==='eL').alive, eRdown=!towers.find(t=>t.key==='eR').alive;
-  if(eLdown&&x<9&&y>6) return true;
-  if(eRdown&&x>=9&&y>6) return true;
+  const me=MYTEAM();
+  if(me===1){
+    if(y>RIVER+0.5) return true;
+    const l=!towers.find(t=>t.key==='eL').alive, r=!towers.find(t=>t.key==='eR').alive;
+    if(l&&x<9&&y>6) return true;
+    if(r&&x>=9&&y>6) return true;
+  } else {
+    if(y<RIVER-0.5) return true;
+    const l=!towers.find(t=>t.key==='pL').alive, r=!towers.find(t=>t.key==='pR').alive;
+    if(l&&x<9&&y<TY-6) return true;
+    if(r&&x>=9&&y<TY-6) return true;
+  }
   return false;
 }
 function drawGhost(){
-  const a=toArena(drag.x,drag.y-tile*1.6), gx=a.x, gy=a.y;
-  const c=CARDS[player.hand[sel]], valid=isValidDeploy(gx,gy,c), T=tile, X=sx(gx), Y=sy(gy);
+  const a=toArena(drag.x,drag.y-tile*1.6*(FLIP()?-1:1)), gx=a.x, gy=a.y;
+  const c=CARDS[mySide().hand[sel]], valid=isValidDeploy(gx,gy,c), T=tile, X=sx(gx), Y=sy(gy);
   if(c.mode==='roll'){
     const w=c.width*T, len=c.range*T, dir=-1;
     ctx.save();
@@ -1105,9 +1203,10 @@ function drawTopBar(){
   ctx.fillStyle=COL.panel; ctx.fillRect(0,0,W,TOP_H);
   ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.fillRect(0,TOP_H-2,W,2);
   ctx.textBaseline='middle';
+  const me=MYTEAM();
   ctx.fillStyle=COL.eTower; ctx.font=`bold ${Math.round(TOP_H*0.42)}px system-ui`; ctx.textAlign='center';
-  ctx.fillText('♔ '+crownCount(-1),W*0.20,TOP_H/2);
-  ctx.fillStyle=COL.pTower; ctx.fillText('♔ '+crownCount(1),W*0.80,TOP_H/2);
+  ctx.fillText('♔ '+crownCount(-me),W*0.20,TOP_H/2);
+  ctx.fillStyle=COL.pTower; ctx.fillText('♔ '+crownCount(me),W*0.80,TOP_H/2);
   const left=overtime?(MATCH_LEN+OVERTIME-matchTime):(MATCH_LEN-matchTime);
   ctx.fillStyle='#fff'; ctx.font=`bold ${Math.round(TOP_H*0.5)}px system-ui`; ctx.fillText(fmtTime(left),W/2,TOP_H/2);
   if(matchTime>=MATCH_LEN-DOUBLE_AT||overtime){ ctx.fillStyle=COL.elixir; ctx.font=`bold ${Math.round(TOP_H*0.24)}px system-ui`;
@@ -1129,20 +1228,20 @@ function drawHUD(){
   ctx.fillStyle=COL.panel; ctx.fillRect(0,hy,W,HUD_H);
   ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.fillRect(0,hy,W,2);
   ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.font=`600 ${Math.round(HUD_H*0.09)}px system-ui`; ctx.textAlign='left'; ctx.textBaseline='alphabetic';
-  ctx.fillText('Next: '+CARDS[player.pending[0]].name,W*0.02,hy+HUD_H*0.20);
+  ctx.fillText('Next: '+CARDS[mySide().pending[0]].name,W*0.02,hy+HUD_H*0.20);
   const ex=W*0.02, ew=W*0.96, ey=hy+HUD_H*0.20, eh=HUD_H*0.09, seg=ew/10;
   ctx.fillStyle='#2a1030'; rr(ctx,ex,ey,ew,eh,eh/2); ctx.fill();
-  const full=Math.floor(player.elixir), frac=player.elixir-full;
+  const _me=mySide(); const full=Math.floor(_me.elixir), frac=_me.elixir-full;
   ctx.save(); rr(ctx,ex,ey,ew,eh,eh/2); ctx.clip();
   ctx.fillStyle=COL.elixir; ctx.fillRect(ex,ey,seg*full,eh);
   ctx.fillStyle=shade(COL.elixir,0.8); ctx.fillRect(ex+seg*full,ey,seg*frac,eh); ctx.restore();
   ctx.strokeStyle='rgba(0,0,0,0.35)'; ctx.lineWidth=1;
   for(let i=1;i<10;i++){ ctx.beginPath(); ctx.moveTo(ex+seg*i,ey); ctx.lineTo(ex+seg*i,ey+eh); ctx.stroke(); }
   ctx.fillStyle='#fff'; ctx.font=`bold ${Math.round(eh*1.1)}px system-ui`; ctx.textAlign='left'; ctx.textBaseline='middle';
-  ctx.fillText(Math.floor(player.elixir),ex+6,ey+eh/2);
+  ctx.fillText(Math.floor(_me.elixir),ex+6,ey+eh/2);
   const rects=cardRects();
   rects.forEach((r,i)=>{
-    const c=CARDS[player.hand[i]], afford=player.elixir>=c.cost, selected=(sel===i);
+    const c=CARDS[_me.hand[i]], afford=_me.elixir>=c.cost, selected=(sel===i);
     ctx.save(); if(selected) ctx.translate(0,-8);
     drawCardFace(c,r,afford,selected);
     ctx.restore();
@@ -1225,6 +1324,10 @@ function drawMenu(){
   ctx.fillStyle='#ffd23c'; ctx.fillText('BRAWL',W/2,H*0.455+Math.min(W,H)*0.095);
   ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.031)}px system-ui`;
   ctx.fillText(`Wins ${stats.wins}  ·  Losses ${stats.losses}  ·  ♔ ${stats.crowns}`,W/2,H*0.60);
+  ctx.textAlign='left'; ctx.fillStyle='rgba(255,255,255,0.30)';
+  ctx.font=`600 ${Math.round(Math.min(W,H)*0.026)}px system-ui`;
+  ctx.fillText('v'+GAME_VERSION+(Net.ready?' · online ready':''),10,TOP_H*0.55);
+  ctx.textAlign='center';
   buttons=[];
   ctx.fillStyle='rgba(255,255,255,0.55)'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.030)}px system-ui`;
   ctx.fillText('Difficulty',W/2,H*0.645);
@@ -1236,12 +1339,17 @@ function drawMenu(){
   });
   drawButton('PLAY',W/2,H*0.785,W*0.62,H*0.075,'#3a86c4',()=>{
     if(stats.deck.length!==8){ state='deck'; deckMsg='Pick 8 cards to start'; } else startMatch(); });
-  drawButton('Deck',W*0.295,H*0.872,W*0.42,H*0.055,'#2a3547',()=>{state='deck'; deckMsg='';});
-  drawButton('Records',W*0.705,H*0.872,W*0.42,H*0.055,'#2a3547',()=>{state='stats';});
-  drawButton('How to play',W/2,H*0.945,W*0.62,H*0.05,'#222c3c',()=>{state='help';});
+  drawButton('PLAY ONLINE',W/2,H*0.862,W*0.62,H*0.062,'#2f7d4f',()=>{ Net.status=''; state='netmenu'; netInit(()=>{}); });
+  drawButton('Deck',W*0.295,H*0.935,W*0.42,H*0.05,'#2a3547',()=>{state='deck'; deckMsg='';});
+  drawButton('Records',W*0.705,H*0.935,W*0.42,H*0.05,'#2a3547',()=>{state='stats';});
+  drawButton('How to play',W/2,H*0.985,W*0.62,H*0.042,'#222c3c',()=>{state='help';});
   if(state==='help') drawHelp();
   if(state==='stats') drawStats();
   if(state==='deck') drawDeck();
+  if(state==='netmenu') drawNetMenu();
+  if(state==='netjoin') drawNetJoin();
+  if(state==='netroom') drawNetRoom();
+  if(state==='netsearch') drawNetSearch();
 }
 function drawHelp(){
   ctx.fillStyle='rgba(5,8,14,0.93)'; ctx.fillRect(0,0,W,H);
@@ -1280,7 +1388,7 @@ function drawStats(){
     const label=h.r==='victory'?'WIN':(h.r==='defeat'?'LOSS':'DRAW');
     ctx.textAlign='left'; ctx.fillStyle=col; ctx.font=`bold ${Math.round(rowH*0.6)}px system-ui`; ctx.fillText(label,W*0.22,y);
     ctx.fillStyle='rgba(255,255,255,0.45)'; ctx.font=`600 ${Math.round(rowH*0.5)}px system-ui`;
-    ctx.fillText(h.d?AI_LEVELS[h.d].label:'',W*0.42,y);
+    ctx.fillText(h.d==='online'?'Online':(AI_LEVELS[h.d]?AI_LEVELS[h.d].label:''),W*0.42,y);
     ctx.textAlign='right'; ctx.fillStyle='rgba(255,255,255,0.8)'; ctx.font=`600 ${Math.round(rowH*0.54)}px system-ui`;
     ctx.fillText(`♔ ${h.my} — ${h.foe}`,W*0.78,y); y+=rowH;
   });
@@ -1312,17 +1420,22 @@ function drawPause(){
 }
 function drawOver(){
   ctx.fillStyle='rgba(5,8,14,0.8)'; ctx.fillRect(0,0,W,H);
-  const win=result==='victory', draw=result==='draw';
+  const win=result==='victory', draw=result==='draw', bad=result==='desync';
   ctx.textAlign='center'; ctx.textBaseline='middle';
-  ctx.fillStyle=win?'#ffd23c':(draw?'#cfd6e0':'#ff6a5a'); ctx.font=`bold ${Math.round(Math.min(W,H)*0.11)}px "Trebuchet MS",system-ui`;
-  ctx.fillText(win?'VICTORY!':(draw?'DRAW':'DEFEAT'),W/2,H*0.34);
+  ctx.fillStyle=bad?'#ff9a6a':(win?'#ffd23c':(draw?'#cfd6e0':'#ff6a5a'));
+  ctx.font=`bold ${Math.round(Math.min(W,H)*(bad?0.075:0.11))}px "Trebuchet MS",system-ui`;
+  ctx.fillText(bad?'MATCH DESYNCED':(win?'VICTORY!':(draw?'DRAW':'DEFEAT')),W/2,H*0.34);
+  if(bad){ ctx.fillStyle='rgba(255,255,255,0.65)'; ctx.font=`500 ${Math.round(Math.min(W,H)*0.028)}px system-ui`;
+    ctx.fillText('The two games drifted apart and the result',W/2,H*0.41);
+    ctx.fillText('would not have been fair. Nothing was recorded.',W/2,H*0.45); }
   ctx.fillStyle='#fff'; ctx.font=`bold ${Math.round(Math.min(W,H)*0.05)}px system-ui`;
   ctx.fillText(`You ♔ ${crownCount(1)}   —   ♔ ${crownCount(-1)} Foe`,W/2,H*0.44);
   ctx.fillStyle='rgba(255,255,255,0.6)'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.032)}px system-ui`;
   ctx.fillText(`Record  ${stats.wins}W · ${stats.losses}L · ${stats.draws}D   (${AI_LEVELS[difficulty].label})`,W/2,H*0.505);
   buttons=[];
-  drawButton('PLAY AGAIN',W/2,H*0.61,W*0.6,H*0.08,'#3a86c4',()=>startMatch());
-  drawButton('Main menu',W/2,H*0.72,W*0.6,H*0.062,'#2a3547',()=>{state='menu';});
+  drawButton('PLAY AGAIN',W/2,H*0.61,W*0.6,H*0.08,'#3a86c4',()=>{ netLeave(true); startMatch(); });
+  drawButton('Play online',W/2,H*0.715,W*0.6,H*0.058,'#2f7d4f',()=>{ netLeave(true); Net.status=''; state='netmenu'; netInit(()=>{}); });
+  drawButton('Main menu',W/2,H*0.80,W*0.6,H*0.055,'#2a3547',()=>{ netLeave(true); state='menu'; });
 }
 
 /* --------------------------- DECK BUILDER -------------------------- */
@@ -1399,17 +1512,353 @@ function drawDeck(){
     ()=>{ if(stats.deck.length===8) startMatch(); else deckMsg='Choose exactly 8 cards to play'; });
 }
 
+/* =========================== NETWORK (Firebase) ======================
+   Deterministic lockstep over Realtime Database. Only card plays cross
+   the wire; both clients run the identical simulation from a shared seed.
+   Host is team 1, guest is team -1; the guest's view is mirrored.
+   ==================================================================== */
+const FB_CONFIG = {
+  apiKey: "AIzaSyBfQGKZ7GOOk8UpGMLXrAS-AS-VaOr11rM",
+  authDomain: "bridge-brawl-54f96.firebaseapp.com",
+  databaseURL: "https://bridge-brawl-54f96-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "bridge-brawl-54f96",
+  storageBucket: "bridge-brawl-54f96.firebasestorage.app",
+  messagingSenderId: "828078912626",
+  appId: "1:828078912626:web:d373cff80658299e00feeb"
+};
+const NET_DELAY_TICKS = 18;        // ~300ms cover for a ~200ms relay
+const SYNC_EVERY      = 120;       // checksum exchange cadence (ticks)
+const GRACE_MS        = 6000;      // opponent disconnect grace period
+
+const Net = {
+  ready:false, err:'', uid:null, db:null,
+  on:false, role:null, myTeam:1, code:null,
+  roomRef:null, refs:[], status:'', foeDeck:null, foeSeen:0,
+  desync:false, foeLeft:false, lastSyncTick:0, sums:{}, seed:0,
+  searching:false, queueRef:null,
+};
+function netAvailable(){ return typeof firebase!=='undefined' && firebase && firebase.initializeApp; }
+function netInit(cb){
+  if(Net.ready){ cb&&cb(null); return; }
+  if(!netAvailable()){ Net.err='Firebase SDK failed to load. Check your connection.'; cb&&cb(Net.err); return; }
+  try{
+    if(!firebase.apps.length) firebase.initializeApp(FB_CONFIG);
+    Net.db=firebase.database();
+    firebase.auth().signInAnonymously().catch(e=>{
+      Net.err = (e && e.code==='auth/unauthorized-domain')
+        ? 'This domain is not authorised in Firebase Auth. Add it under Authentication → Settings → Authorized domains.'
+        : ('Sign-in failed: '+((e&&e.code)||e));
+      cb&&cb(Net.err);
+    });
+    firebase.auth().onAuthStateChanged(u=>{
+      if(u){ Net.uid=u.uid; Net.ready=true; Net.err=''; cb&&cb(null); }
+    });
+  }catch(e){ Net.err='Firebase init failed: '+e.message; cb&&cb(Net.err); }
+}
+function netCode(){
+  const A='ABCDEFGHJKLMNPQRSTUVWXYZ';   // no I/O to avoid confusion with 1/0
+  let s=''; for(let i=0;i<4;i++) s+=A[(Math.random()*A.length)|0];
+  return s;
+}
+function netTrack(ref,ev,fn){ ref.on(ev,fn); Net.refs.push({ref,ev,fn}); }
+function netCleanup(){
+  for(const r of Net.refs){ try{ r.ref.off(r.ev,r.fn); }catch(e){} }
+  Net.refs=[];
+  if(Net.queueRef){ try{ Net.queueRef.remove(); }catch(e){} Net.queueRef=null; }
+}
+function netLeave(quiet){
+  netCleanup();
+  if(Net.roomRef && Net.uid && !quiet){
+    try{ Net.roomRef.child('players/'+Net.uid+'/gone').set(true); }catch(e){}
+  }
+  Net.on=false; Net.role=null; Net.code=null; Net.roomRef=null;
+  Net.myTeam=1; Net.desync=false; Net.foeLeft=false; Net.foeDeck=null;
+  Net.searching=false; Net.sums={}; Net.status='';
+}
+
+/* ---- room lifecycle ---- */
+function netHost(){
+  Net.status='Creating room…';
+  netInit(err=>{
+    if(err){ Net.status=err; return; }
+    const code=netCode();
+    Net.code=code; Net.role='host'; Net.myTeam=1;
+    Net.seed=(Math.random()*0xFFFFFFFF)>>>0;
+    Net.roomRef=Net.db.ref('rooms/'+code);
+    Net.roomRef.set({
+      host:Net.uid, seed:Net.seed, createdAt:Date.now(), state:'waiting',
+      players:{ [Net.uid]:{ role:'host', deck:stats.deck, ts:Date.now() } }
+    }).then(()=>{
+      Net.roomRef.child('players/'+Net.uid).onDisconnect().update({gone:true});
+      Net.status='Waiting for opponent…';
+      state='netroom';
+      netWatchRoom();
+    }).catch(e=>{ Net.status='Could not create room: '+(e.code||e.message); });
+  });
+}
+function netJoin(code){
+  Net.status='Joining '+code+'…';
+  netInit(err=>{
+    if(err){ Net.status=err; return; }
+    const ref=Net.db.ref('rooms/'+code);
+    ref.get().then(snap=>{
+      const v=snap.val();
+      if(!v){ Net.status='No room with code '+code; return; }
+      if(v.guest && v.guest!==Net.uid){ Net.status='That room is full'; return; }
+      Net.code=code; Net.role='guest'; Net.myTeam=-1;
+      Net.seed=v.seed>>>0; Net.roomRef=ref;
+      const hostEntry=v.players&&v.players[v.host];
+      Net.foeDeck=(hostEntry&&hostEntry.deck)||DEFAULT_DECK.slice();
+      return ref.update({
+        guest:Net.uid,
+        ['players/'+Net.uid]:{ role:'guest', deck:stats.deck, ts:Date.now() }
+      }).then(()=>{
+        ref.child('players/'+Net.uid).onDisconnect().update({gone:true});
+        Net.status='Connected — starting…';
+        state='netroom';
+        netWatchRoom();
+      });
+    }).catch(e=>{ Net.status='Join failed: '+(e.code||e.message); });
+  });
+}
+function netWatchRoom(){
+  const ref=Net.roomRef;
+  netTrack(ref.child('players'),'value',snap=>{
+    const p=snap.val()||{};
+    const others=Object.keys(p).filter(k=>k!==Net.uid);
+    if(!others.length) return;
+    const foe=p[others[0]];
+    if(foe.gone){ if(Net.on) Net.foeLeft=true; else { Net.status='Opponent left'; } return; }
+    if(foe.deck) Net.foeDeck=foe.deck;
+    if(!Net.on && Net.foeDeck) netBegin();
+  });
+  netTrack(ref.child('cmds'),'child_added',snap=>{
+    if(snap.key===Net.uid) return;
+    netTrack(ref.child('cmds/'+snap.key),'child_added',cs=>{
+      const c=cs.val(); if(!c) return;
+      queueCommand({tick:c.t, type:'deploy', team:-Net.myTeam, slot:c.s, x:c.x, y:c.y});
+    });
+  });
+  netTrack(ref.child('sync'),'value',snap=>{
+    const s=snap.val()||{};
+    for(const k in s){ if(k!==Net.uid) Net.sums[s[k].tick]=s[k].sum; }
+  });
+}
+function netBegin(){
+  Net.on=true; Net.desync=false; Net.foeLeft=false; Net.sums={};
+  INPUT_DELAY=NET_DELAY_TICKS;
+  Net.status='';
+  const myDeck=stats.deck.slice(), foe=(Net.foeDeck||DEFAULT_DECK).slice();
+  startMatch(Net.seed, Net.role==='host'?myDeck:foe, Net.role==='host'?foe:myDeck);
+}
+/* ---- quick match queue ---- */
+function netQuick(){
+  Net.status='Searching…';
+  netInit(err=>{
+    if(err){ Net.status=err; return; }
+    Net.searching=true; state='netsearch';
+    const qref=Net.db.ref('queue/'+Net.uid);
+    Net.queueRef=qref;
+    qref.set({t:Date.now(), deck:stats.deck});
+    qref.onDisconnect().remove();
+    netTrack(qref,'value',snap=>{                       // someone paired with me
+      const v=snap.val();
+      if(v&&v.room){ const code=v.room; qref.remove(); Net.queueRef=null; netJoin(code); }
+    });
+    netTrack(Net.db.ref('queue'),'value',snap=>{
+      if(!Net.searching||Net.on) return;
+      const q=snap.val()||{};
+      const others=Object.keys(q).filter(k=>k!==Net.uid&&!q[k].room);
+      if(!others.length) return;
+      others.sort();
+      const foeUid=others[0];
+      if(Net.uid<foeUid){                                // lower uid hosts — no race
+        Net.searching=false;
+        const code=netCode();
+        Net.code=code; Net.role='host'; Net.myTeam=1;
+        Net.seed=(Math.random()*0xFFFFFFFF)>>>0;
+        Net.roomRef=Net.db.ref('rooms/'+code);
+        Net.roomRef.set({
+          host:Net.uid, seed:Net.seed, createdAt:Date.now(), state:'waiting',
+          players:{ [Net.uid]:{ role:'host', deck:stats.deck, ts:Date.now() } }
+        }).then(()=>{
+          Net.roomRef.child('players/'+Net.uid).onDisconnect().update({gone:true});
+          Net.db.ref('queue/'+foeUid+'/room').set(code);
+          if(Net.queueRef){ Net.queueRef.remove(); Net.queueRef=null; }
+          Net.status='Opponent found…'; state='netroom'; netWatchRoom();
+        }).catch(e=>{ Net.status='Match failed: '+(e.code||e.message); Net.searching=true; });
+      }
+    });
+  });
+}
+/* ---- in-match traffic ---- */
+function netSendDeploy(c){
+  if(!Net.on||!Net.roomRef) return;
+  try{ Net.roomRef.child('cmds/'+Net.uid).push({t:c.tick, s:c.slot, x:c.x, y:c.y}); }catch(e){}
+}
+function netTickSync(){
+  if(!Net.on||!Net.roomRef) return;
+  if(tick-Net.lastSyncTick < SYNC_EVERY) return;
+  Net.lastSyncTick=tick;
+  const sum=stateChecksum();
+  try{ Net.roomRef.child('sync/'+Net.uid).set({tick, sum}); }catch(e){}
+  for(const t in Net.sums){
+    if(Math.abs(t-tick)<1 && Net.sums[t]!==sum){ Net.desync=true; }
+  }
+}
+function netUpdate(dt){
+  if(!Net.on) return;
+  netTickSync();
+  if(Net.foeLeft && state==='playing'){
+    Net.foeGrace=(Net.foeGrace||0)+dt*1000;
+    if(Net.foeGrace>GRACE_MS){ Net.foeGrace=0; endMatch(Net.myTeam===1?'victory':'defeat'); }
+  } else Net.foeGrace=0;
+  if(Net.desync && state==='playing'){ result='desync'; recordDesync(); state='over'; netCleanup(); Net.on=false; INPUT_DELAY=0; refreshAudio(); }
+}
+
+/* view helpers — guest sees the board mirrored, sim stays canonical */
+function FLIP(){ return Net.on && Net.myTeam===-1; }
+function MYTEAM(){ return Net.on ? Net.myTeam : 1; }
+function mySide(){ return MYTEAM()===1 ? player : enemy; }
+function foeSide(){ return MYTEAM()===1 ? enemy : player; }
+
+
+/* ---------------------------- ONLINE UI ---------------------------- */
+let joinBuf='';
+function netPanel(title){
+  ctx.fillStyle='rgba(5,8,14,0.95)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle='#ffd23c'; ctx.font=`bold ${Math.round(Math.min(W,H)*0.055)}px "Trebuchet MS",system-ui`;
+  ctx.fillText(title,W/2,H*0.10);
+}
+function netStatusLine(y){
+  if(!Net.status) return;
+  ctx.fillStyle=/fail|not |No room|full|error|Error|domain/i.test(Net.status)?'#ff8a7a':'rgba(255,255,255,0.75)';
+  ctx.font=`600 ${Math.round(Math.min(W,H)*0.028)}px system-ui`;
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  wrapText(Net.status,W/2,y,W*0.86,Math.min(W,H)*0.036);
+}
+function drawNetMenu(){
+  netPanel('PLAY ONLINE');
+  ctx.fillStyle=Net.ready?'#4fd06a':(Net.err?'#ff8a7a':'rgba(255,255,255,0.6)');
+  ctx.font=`600 ${Math.round(Math.min(W,H)*0.03)}px system-ui`;
+  ctx.fillText(Net.ready?'Connected':(Net.err?'Connection problem':'Connecting…'),W/2,H*0.17);
+  netStatusLine(H*0.24);
+  buttons=[];
+  drawButton('Create Room',W/2,H*0.38,W*0.66,H*0.075,'#3a86c4',()=>netHost());
+  drawButton('Join with Code',W/2,H*0.49,W*0.66,H*0.075,'#2f7d4f',()=>{ joinBuf=''; Net.status=''; state='netjoin'; });
+  drawButton('Quick Match',W/2,H*0.60,W*0.66,H*0.075,'#6a4aa8',()=>netQuick());
+  ctx.fillStyle='rgba(255,255,255,0.45)'; ctx.font=`500 ${Math.round(Math.min(W,H)*0.026)}px system-ui`;
+  ctx.fillText('Your chosen deck comes with you',W/2,H*0.71);
+  ctx.fillText('Both players need the same game version',W/2,H*0.75);
+  drawButton('Back',W/2,H*0.88,W*0.5,H*0.06,'#2a3547',()=>{ netLeave(true); state='menu'; });
+}
+function keyRects(){
+  const rows=['ABCDEFG','HJKLMNP','QRSTUVW','XYZ'];
+  const out=[], top=H*0.44, kh=Math.min(H*0.068,W*0.12), pad=W*0.012;
+  rows.forEach((row,r)=>{
+    const kw=Math.min((W-pad*(row.length+1))/row.length,W*0.12);
+    const gw=row.length*kw+pad*(row.length-1), x0=(W-gw)/2;
+    for(let i=0;i<row.length;i++)
+      out.push({x:x0+i*(kw+pad), y:top+r*(kh+pad), w:kw, h:kh, ch:row[i]});
+  });
+  return out;
+}
+function drawNetJoin(){
+  netPanel('JOIN ROOM');
+  ctx.fillStyle='rgba(255,255,255,0.6)'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.03)}px system-ui`;
+  ctx.fillText('Enter the 4-letter code',W/2,H*0.175);
+  const bw=Math.min(W*0.17,H*0.085), gap=W*0.025, tot=bw*4+gap*3, x0=(W-tot)/2, y=H*0.24;
+  for(let i=0;i<4;i++){
+    const x=x0+i*(bw+gap);
+    ctx.fillStyle=i<joinBuf.length?'#243046':'#1a2230';
+    rr(ctx,x,y,bw,bw,8); ctx.fill();
+    ctx.strokeStyle=i===joinBuf.length?'#ffd23c':'rgba(255,255,255,0.18)';
+    ctx.lineWidth=i===joinBuf.length?3:1.5; rr(ctx,x,y,bw,bw,8); ctx.stroke();
+    if(i<joinBuf.length){
+      ctx.fillStyle='#fff'; ctx.font=`bold ${Math.round(bw*0.55)}px "Trebuchet MS",system-ui`;
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(joinBuf[i],x+bw/2,y+bw/2);
+    }
+  }
+  netStatusLine(H*0.375);
+  buttons=[];
+  for(const k of keyRects()){
+    const on=joinBuf.length<4;
+    ctx.fillStyle=on?'#2a3547':'#20262f'; rr(ctx,k.x,k.y,k.w,k.h,6); ctx.fill();
+    ctx.fillStyle=on?'#fff':'rgba(255,255,255,0.3)';
+    ctx.font=`bold ${Math.round(k.h*0.5)}px "Trebuchet MS",system-ui`;
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(k.ch,k.x+k.w/2,k.y+k.h/2);
+  }
+  const ready=joinBuf.length===4;
+  drawButton('⌫',W*0.22,H*0.815,W*0.26,H*0.058,'#3d2a2a',()=>{ joinBuf=joinBuf.slice(0,-1); Net.status=''; });
+  drawButton(ready?'JOIN':'…',W*0.60,H*0.815,W*0.42,H*0.058,ready?'#2f7d4f':'#39414f',
+    ()=>{ if(joinBuf.length===4) netJoin(joinBuf); });
+  drawButton('Back',W/2,H*0.90,W*0.5,H*0.055,'#2a3547',()=>{ Net.status=''; state='netmenu'; });
+}
+function drawNetRoom(){
+  netPanel('ROOM');
+  if(Net.code){
+    ctx.fillStyle='rgba(255,255,255,0.6)'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.03)}px system-ui`;
+    ctx.fillText('Share this code with your friend',W/2,H*0.22);
+    ctx.fillStyle='#ffd23c'; ctx.font=`bold ${Math.round(Math.min(W,H)*0.15)}px "Trebuchet MS",system-ui`;
+    ctx.fillText(Net.code,W/2,H*0.34);
+  }
+  const dots='.'.repeat(1+(((now/500)|0)%3));
+  ctx.fillStyle='rgba(255,255,255,0.8)'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.032)}px system-ui`;
+  ctx.fillText((Net.status||'Waiting for opponent')+dots,W/2,H*0.48);
+  buttons=[];
+  drawButton('Cancel',W/2,H*0.78,W*0.55,H*0.065,'#c8483f',()=>{ netLeave(); state='netmenu'; });
+}
+function drawNetSearch(){
+  netPanel('QUICK MATCH');
+  const dots='.'.repeat(1+(((now/500)|0)%3));
+  ctx.fillStyle='#fff'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.036)}px system-ui`;
+  ctx.fillText('Searching for an opponent'+dots,W/2,H*0.35);
+  ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.font=`500 ${Math.round(Math.min(W,H)*0.027)}px system-ui`;
+  ctx.fillText('You will be paired with the next',W/2,H*0.43);
+  ctx.fillText('player waiting in the queue',W/2,H*0.47);
+  netStatusLine(H*0.56);
+  buttons=[];
+  drawButton('Cancel',W/2,H*0.78,W*0.55,H*0.065,'#c8483f',()=>{ netLeave(); state='netmenu'; });
+}
+function drawNetQuit(){
+  ctx.fillStyle='rgba(5,8,14,0.85)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle='#fff'; ctx.font=`bold ${Math.round(Math.min(W,H)*0.055)}px "Trebuchet MS",system-ui`;
+  ctx.fillText('Leave the match?',W/2,H*0.34);
+  ctx.fillStyle='rgba(255,255,255,0.6)'; ctx.font=`500 ${Math.round(Math.min(W,H)*0.029)}px system-ui`;
+  ctx.fillText('Online matches cannot be paused.',W/2,H*0.41);
+  ctx.fillText('Leaving counts as a loss.',W/2,H*0.45);
+  buttons=[];
+  drawButton('Keep playing',W/2,H*0.57,W*0.6,H*0.07,'#3a86c4',()=>{ state='playing'; });
+  drawButton('Forfeit',W/2,H*0.68,W*0.6,H*0.07,'#c8483f',()=>{
+    state='playing'; const r=MYTEAM()===1?'defeat':'victory'; netLeave(); endMatch(r); });
+}
+function drawNetBadge(){
+  const w=W*0.32, h=TOP_H*0.40, x=W/2-w/2, y=TOP_H+4;
+  ctx.fillStyle='rgba(10,14,22,0.62)'; rr(ctx,x,y,w,h,h/2); ctx.fill();
+  const good=!Net.foeLeft&&!Net.desync;
+  ctx.fillStyle=good?'#4fd06a':'#ff6a5a';
+  ctx.beginPath(); ctx.arc(x+h*0.6,y+h/2,h*0.22,0,7); ctx.fill();
+  ctx.fillStyle='rgba(255,255,255,0.85)'; ctx.font=`600 ${Math.round(h*0.55)}px system-ui`;
+  ctx.textAlign='left'; ctx.textBaseline='middle';
+  ctx.fillText(Net.foeLeft?'Opponent left…':(Net.desync?'Desync':'Online'),x+h*1.05,y+h/2);
+}
+
 /* ------------------------------ INPUT ------------------------------ */
 function evPos(e){ const r=cv.getBoundingClientRect(); const t=e.touches?e.touches[0]:e; return {x:t.clientX-r.left,y:t.clientY-r.top}; }
 function inRect(p,r){ return p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h; }
 function tryDeploy(px,py){
-  if(sel<0) return; const c=CARDS[player.hand[sel]];
-  if(player.elixir<c.cost){ sel=-1; return; }
-  const a=toArena(px,py-tile*1.6);
+  const me=mySide();
+  if(sel<0) return; const c=CARDS[me.hand[sel]];
+  if(me.elixir<c.cost){ sel=-1; return; }
+  const a=toArena(px,py-tile*1.6*(FLIP()?-1:1));
   if(!isValidDeploy(a.x,a.y,c)) return;
-  player.elixir-=c.cost;
-  const played=playFromHand(player,sel);
-  spawnCard(player,played,a.x,a.y); sel=-1;
+  const cmd=issueDeploy(MYTEAM(),sel,a.x,a.y);
+  netSendDeploy(cmd);
+  sel=-1;
 }
 function onDown(e){
   e.preventDefault(); resumeAC(); const p=evPos(e);
@@ -1418,14 +1867,24 @@ function onDown(e){
     for(const r of deckRects()){ if(inRect(p,r)){ toggleDeckCard(r.key); return; } }
     return;
   }
+  if(state==='netjoin'){
+    for(const b of buttons){ if(inRect(p,b)){ b.onClick(); return; } }
+    if(joinBuf.length<4) for(const k of keyRects()){
+      if(inRect(p,k)){ joinBuf+=k.ch; Net.status=''; return; } }
+    return;
+  }
+  if(state==='netquit'){
+    for(const b of buttons){ if(inRect(p,b)){ b.onClick(); return; } }
+    return;
+  }
   if(state!=='playing'){
     for(const b of buttons){ if(inRect(p,b)){ b.onClick(); return; } }
     return;
   }
-  if(inRect(p,pauseRect())){ state='paused'; sel=-1; dragging=false; refreshAudio(); return; }
+  if(inRect(p,pauseRect())){ if(Net.on){ state='netquit'; return; } state='paused'; sel=-1; dragging=false; refreshAudio(); return; }
   const rects=cardRects();
   for(let i=0;i<rects.length;i++){ if(inRect(p,rects[i])){
-    if(player.elixir>=CARDS[player.hand[i]].cost){ sel=i; dragging=true; drag=p; }
+    if(mySide().elixir>=CARDS[mySide().hand[i]].cost){ sel=i; dragging=true; drag=p; }
     return; } }
   if(sel>=0&&p.y<H-HUD_H){ dragging=true; drag=p; }
 }
