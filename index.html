@@ -42,7 +42,7 @@ const RIVER = 14;
 const BR_L = 4, BR_R = 14;
 const BRIDGE_HALF = 0.62;             // half-width of walkable bridge deck
 const MATCH_LEN = 150, DOUBLE_AT = 40, OVERTIME = 60;
-const GAME_VERSION = '2.0';
+const GAME_VERSION = '2.1';
 const STEP = 1/60;
 /* Deploy delay scales with card weight: cheap cycle cards land fast,
    heavy tanks telegraph. Per-card `deploy` overrides this fallback. */
@@ -207,21 +207,40 @@ document.getElementById('mute').addEventListener('click',()=>{
 
 /* ----------------------------- STORAGE ----------------------------- */
 const STORE_KEY='bridgeBrawl_v2';
-let stats={wins:0,losses:0,draws:0,crowns:0,games:0,history:[],deck:DEFAULT_DECK.slice(),difficulty:'medium'};
+let stats={wins:0,losses:0,draws:0,crowns:0,games:0,history:[],deck:DEFAULT_DECK.slice(),difficulty:'medium',
+  gold:0, unlocked:DEFAULT_DECK.slice(), copies:{}, levels:{}, chests:[]};
 function loadStats(){
   try{
     const s=localStorage.getItem(STORE_KEY);
     if(s){ const p=JSON.parse(s); if(p&&typeof p==='object') stats=Object.assign(stats,p); }
   }catch(e){}
+  // migration: saves from before the collection system
+  if(!Array.isArray(stats.unlocked)||!stats.unlocked.length) stats.unlocked=DEFAULT_DECK.slice();
+  stats.unlocked=stats.unlocked.filter(k=>CARDS[k]);
+  if(typeof stats.gold!=='number') stats.gold=0;
+  if(!stats.copies||typeof stats.copies!=='object') stats.copies={};
+  if(!stats.levels||typeof stats.levels!=='object') stats.levels={};
+  if(!Array.isArray(stats.chests)) stats.chests=[];
   if(!Array.isArray(stats.deck)) stats.deck=DEFAULT_DECK.slice();
-  stats.deck=stats.deck.filter(k=>CARDS[k]);
-  if(stats.deck.length!==8) stats.deck=DEFAULT_DECK.slice();
+  stats.deck=stats.deck.filter(k=>CARDS[k]&&isUnlocked(k));
+  if(stats.deck.length<8){                       // pad from whatever is unlocked
+    for(const k of stats.unlocked){ if(stats.deck.length>=8) break; if(stats.deck.indexOf(k)<0) stats.deck.push(k); }
+  }
+  if(stats.deck.length>8) stats.deck=stats.deck.slice(0,8);
   difficulty=AI_LEVELS[stats.difficulty]?stats.difficulty:'medium';
 }
 function saveStats(){ try{ stats.difficulty=difficulty; localStorage.setItem(STORE_KEY,JSON.stringify(stats)); }catch(e){} }
+let lastReward=null;
 function recordResult(r){
   if(r==='desync') return;
   const me=MYTEAM(), my=crownCount(me), foe=crownCount(-me);
+  lastReward=null;
+  const tier=chestForResult(r,my);
+  if(tier){
+    lastReward = grantChest(tier) ? {tier} : {tier, full:true};
+  } else if(my>0){
+    const g=8*my; stats.gold=(stats.gold||0)+g; lastReward={gold:g};
+  }
   stats.games++; stats.crowns+=my;
   if(r==='victory') stats.wins++; else if(r==='defeat') stats.losses++; else stats.draws++;
   stats.history.unshift({r,my,foe,d:Net.on?'online':difficulty,t:Date.now()});
@@ -229,13 +248,96 @@ function recordResult(r){
   saveStats();
 }
 function recordDesync(){}
-function resetStats(){
-  const d=stats.deck;
-  stats={wins:0,losses:0,draws:0,crowns:0,games:0,history:[],deck:d,difficulty};
+function resetStats(){          // clears record only — keeps your collection
+  stats.wins=0; stats.losses=0; stats.draws=0; stats.crowns=0; stats.games=0; stats.history=[];
   saveStats();
 }
 
-/* ----------------------------- HELPERS ----------------------------- */
+/* --------------------- COLLECTION & CHESTS ------------------------- */
+const CHESTS = {
+  wood:  {name:'Wooden Chest', color:'#a8763f', gold:[15,30],  copies:[4,8],   spread:[1,2], newCard:0.12, cost:60},
+  silver:{name:'Silver Chest', color:'#c2cad6', gold:[40,75],  copies:[10,18], spread:[2,3], newCard:0.42, cost:180},
+  gold:  {name:'Golden Chest', color:'#e9c86a', gold:[95,160], copies:[24,36], spread:[3,4], newCard:1.00, cost:450},
+};
+const LV_REQ   = [0,2,4,10,20];      // copies needed to leave level n
+const LV_MAX   = 5;
+const LV_SCALE = 0.07;               // +7% hp/dmg per level above 1
+const LEVELS_ONLINE = true;          // false -> all cards forced to level 1 in PvP
+const MAX_CHESTS = 6;
+
+function isUnlocked(k){ return stats.unlocked.indexOf(k)>=0; }
+function cardLevel(k){ return Math.min(LV_MAX, stats.levels[k]||1); }
+function copiesNeeded(lv){ return LV_REQ[lv]||0; }
+function shufflePlain(a){                       // Math.random — never touches the sim RNG
+  a=a.slice(); for(let i=a.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; const t=a[i]; a[i]=a[j]; a[j]=t; }
+  return a;
+}
+function addCopies(k,n){
+  stats.copies[k]=(stats.copies[k]||0)+n;
+  let lv=cardLevel(k), ups=0;
+  while(lv<LV_MAX && stats.copies[k]>=LV_REQ[lv]){ stats.copies[k]-=LV_REQ[lv]; lv++; ups++; }
+  stats.levels[k]=lv;
+  return ups;
+}
+function myLevels(){
+  const o={}; for(const k of POOL){ const l=cardLevel(k); if(l>1) o[k]=l; } return o;
+}
+function scaleCard(c,lv){
+  if(!lv||lv<=1) return c;
+  const m=1+(lv-1)*LV_SCALE, o=Object.assign({},c);
+  if(o.hp)  o.hp =Math.round(o.hp*m);
+  if(o.dmg) o.dmg=Math.round(o.dmg*m);
+  return o;
+}
+function buildSideCards(side,levels){
+  side.lv=levels||{}; side.cards={};
+  for(const k of POOL) side.cards[k]=scaleCard(CARDS[k], side.lv[k]||1);
+}
+function chestForResult(r,myCrowns){
+  if(r!=='victory') return null;
+  if(myCrowns>=3) return 'gold';
+  if(myCrowns>=2) return 'silver';
+  return 'wood';
+}
+function grantChest(tier){
+  if(!tier) return false;
+  if(stats.chests.length>=MAX_CHESTS) return false;
+  stats.chests.push(tier); saveStats(); return true;
+}
+function openChest(tier){
+  const c=CHESTS[tier];
+  const out={tier, gold:0, cards:{}, unlocked:[], levelUps:{}};
+  out.gold=c.gold[0]+((Math.random()*(c.gold[1]-c.gold[0]+1))|0);
+  stats.gold=(stats.gold||0)+out.gold;
+
+  const locked=POOL.filter(k=>!isUnlocked(k));
+  if(locked.length && Math.random()<c.newCard){
+    const k=locked[(Math.random()*locked.length)|0];
+    stats.unlocked.push(k); out.unlocked.push(k);
+    stats.levels[k]=stats.levels[k]||1;
+  }
+  let total=c.copies[0]+((Math.random()*(c.copies[1]-c.copies[0]+1))|0);
+  const pool=shufflePlain(stats.unlocked.filter(k=>cardLevel(k)<LV_MAX || true));
+  const want=c.spread[0]+((Math.random()*(c.spread[1]-c.spread[0]+1))|0);
+  const picks=pool.slice(0,Math.max(1,Math.min(want,pool.length)));
+  picks.forEach((k,i)=>{
+    const share=(i===picks.length-1)?total:Math.max(1,Math.round(total/(picks.length-i)));
+    total-=share;
+    out.cards[k]=(out.cards[k]||0)+share;
+    const ups=addCopies(k,share);
+    if(ups) out.levelUps[k]=ups;
+  });
+  saveStats();
+  return out;
+}
+function buyChest(tier){
+  const c=CHESTS[tier];
+  if((stats.gold||0)<c.cost) return 'Not enough gold';
+  if(stats.chests.length>=MAX_CHESTS) return 'Chest slots are full';
+  stats.gold-=c.cost; stats.chests.push(tier); saveStats(); return null;
+}
+
+
 const clamp=(v,a,b)=>v<a?a:v>b?b:v;
 /* ------------------- DETERMINISM CORE (netcode-ready) ---------------
    Everything the simulation touches must be reproducible from
@@ -485,9 +587,11 @@ function paintUnitBody(g,draw,R,team,color,flash){
 }
 
 /* ------------------------------ DECK ------------------------------- */
-function makeSide(team,deck){
+function makeSide(team,deck,levels){
   const q=shuffle(deck);
-  return {team, elixir:6, hand:q.slice(0,4), pending:q.slice(4,8), aiTimer:1.2};
+  const side={team, elixir:6, hand:q.slice(0,4), pending:q.slice(4,8), aiTimer:1.2};
+  buildSideCards(side, levels);
+  return side;
 }
 function playFromHand(side,slot){
   const played=side.hand[slot];
@@ -496,15 +600,18 @@ function playFromHand(side,slot){
 }
 
 /* ------------------------------ MATCH ------------------------------ */
-function startMatch(seed,deckA,deckB){
+function startMatch(seed,deckA,deckB,lvA,lvB){
   seedSim(seed!=null?seed:(Date.now()>>>0));
   tick=0; cmdQueue=[]; cmdSeq=0;
   units=[]; projectiles=[]; rollers=[]; fx=[]; floaters=[]; towers=[]; uid=1; shake=0;
   matchTime=0; overtime=false; result=''; sel=-1; dragging=false;
   const dA=(Array.isArray(deckA)&&deckA.length===8)?deckA:((Array.isArray(stats.deck)&&stats.deck.length===8)?stats.deck:DEFAULT_DECK);
   const dB=(Array.isArray(deckB)&&deckB.length===8)?deckB:AI_DECKS[difficulty];
-  player=makeSide(1,dA);
-  enemy=makeSide(-1,dB);
+  const useLv = !Net.on || LEVELS_ONLINE;
+  const mineLv = useLv ? (lvA||myLevels()) : {};
+  const foeLv  = useLv ? (lvB||{}) : {};
+  player=makeSide(1,dA,mineLv);
+  enemy=makeSide(-1,dB,foeLv);
   for(const k in TOWERS_DEF){
     const d=TOWERS_DEF[k], st=d.king?TOWER_STATS.king:TOWER_STATS.princess;
     towers.push({key:k,x:d.x,y:d.y,team:d.team,king:d.king,
@@ -516,8 +623,8 @@ function startMatch(seed,deckA,deckB){
 
 /* ------------------------------ SPAWN ------------------------------ */
 function spawnCard(side,cardKey,x,y){
-  const c=CARDS[cardKey];
-  if(c.type==='spell'){ castSpell(side.team,cardKey,x,y); return; }
+  const c=(side.cards&&side.cards[cardKey])||CARDS[cardKey];
+  if(c.type==='spell'){ castSpell(side.team,cardKey,x,y,c); return; }
   const n=c.count||1, positions=formation(n,x,y,side.team);
   const dep=deployTime(c);
   for(let i=0;i<n;i++){
@@ -544,8 +651,8 @@ function formation(n,x,y,team){
     out.push({x:x+col*rank*0.42, y:y+Math.floor(i/2)*0.5*(-team)}); }
   return out;
 }
-function castSpell(team,key,x,y){
-  const c=CARDS[key];
+function castSpell(team,key,x,y,card){
+  const c=card||CARDS[key];
   if(c.mode==='roll'){
     rollers.push({x, y, dir:-team, team, dmg:c.dmg, push:c.push, width:c.width,
       range:c.range, speed:c.rollSpeed, traveled:0, spin:0, hit:{}});
@@ -954,7 +1061,8 @@ function render(){
   ctx.clearRect(0,0,W,H);
   ctx.fillStyle='#0d1119'; ctx.fillRect(0,0,W,H);
   if(state==='menu'||state==='help'||state==='stats'||state==='deck'||
-     state==='netmenu'||state==='netjoin'||state==='netroom'||state==='netsearch'){ drawMenu(); return; }
+     state==='netmenu'||state==='netjoin'||state==='netroom'||state==='netsearch'||
+     state==='chests'||state==='chestopen'||state==='collection'){ drawMenu(); return; }
   if(!player||!towers.length) return;
 
   const shx=shake?(Math.random()*2-1)*shake:0, shy=shake?(Math.random()*2-1)*shake:0;
@@ -1340,9 +1448,12 @@ function drawMenu(){
   drawButton('PLAY',W/2,H*0.785,W*0.62,H*0.075,'#3a86c4',()=>{
     if(stats.deck.length!==8){ state='deck'; deckMsg='Pick 8 cards to start'; } else startMatch(); });
   drawButton('PLAY ONLINE',W/2,H*0.862,W*0.62,H*0.062,'#2f7d4f',()=>{ Net.status=''; state='netmenu'; netInit(()=>{}); });
-  drawButton('Deck',W*0.295,H*0.935,W*0.42,H*0.05,'#2a3547',()=>{state='deck'; deckMsg='';});
-  drawButton('Records',W*0.705,H*0.935,W*0.42,H*0.05,'#2a3547',()=>{state='stats';});
-  drawButton('How to play',W/2,H*0.985,W*0.62,H*0.042,'#222c3c',()=>{state='help';});
+  const nch=stats.chests.length;
+  drawButton('CHESTS'+(nch?'  ('+nch+')':''),W*0.295,H*0.932,W*0.42,H*0.052,
+    nch?'#8a6a12':'#2a3547',()=>{ chestMsg=''; state='chests'; }, nch?'#ffd23c':null);
+  drawButton('Deck',W*0.705,H*0.932,W*0.42,H*0.052,'#2a3547',()=>{state='deck'; deckMsg='';});
+  drawButton('Records',W*0.295,H*0.99,W*0.42,H*0.045,'#222c3c',()=>{state='stats';});
+  drawButton('How to play',W*0.705,H*0.99,W*0.42,H*0.045,'#222c3c',()=>{state='help';});
   if(state==='help') drawHelp();
   if(state==='stats') drawStats();
   if(state==='deck') drawDeck();
@@ -1350,6 +1461,9 @@ function drawMenu(){
   if(state==='netjoin') drawNetJoin();
   if(state==='netroom') drawNetRoom();
   if(state==='netsearch') drawNetSearch();
+  if(state==='chests') drawChests();
+  if(state==='chestopen') drawChestOpen();
+  if(state==='collection') drawCollection();
 }
 function drawHelp(){
   ctx.fillStyle='rgba(5,8,14,0.93)'; ctx.fillRect(0,0,W,H);
@@ -1431,11 +1545,23 @@ function drawOver(){
   ctx.fillStyle='#fff'; ctx.font=`bold ${Math.round(Math.min(W,H)*0.05)}px system-ui`;
   ctx.fillText(`You ♔ ${crownCount(1)}   —   ♔ ${crownCount(-1)} Foe`,W/2,H*0.44);
   ctx.fillStyle='rgba(255,255,255,0.6)'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.032)}px system-ui`;
-  ctx.fillText(`Record  ${stats.wins}W · ${stats.losses}L · ${stats.draws}D   (${AI_LEVELS[difficulty].label})`,W/2,H*0.505);
+  ctx.fillText(`Record  ${stats.wins}W · ${stats.losses}L · ${stats.draws}D`,W/2,H*0.50);
+  if(lastReward){
+    if(lastReward.tier){
+      drawChestIcon(W/2,H*0.565,Math.min(W,H)*0.042,lastReward.tier,0);
+      ctx.fillStyle=lastReward.full?'#ff9a6a':CHESTS[lastReward.tier].color;
+      ctx.font=`bold ${Math.round(Math.min(W,H)*0.031)}px system-ui`;
+      ctx.fillText(lastReward.full?'Chest slots full — make room!':(CHESTS[lastReward.tier].name+' earned!'),W/2,H*0.615);
+    } else if(lastReward.gold){
+      ctx.fillStyle='#f2c33c'; ctx.font=`bold ${Math.round(Math.min(W,H)*0.032)}px system-ui`;
+      ctx.fillText('◉ +'+lastReward.gold+' gold',W/2,H*0.565);
+    }
+  }
   buttons=[];
-  drawButton('PLAY AGAIN',W/2,H*0.61,W*0.6,H*0.08,'#3a86c4',()=>{ netLeave(true); startMatch(); });
-  drawButton('Play online',W/2,H*0.715,W*0.6,H*0.058,'#2f7d4f',()=>{ netLeave(true); Net.status=''; state='netmenu'; netInit(()=>{}); });
-  drawButton('Main menu',W/2,H*0.80,W*0.6,H*0.055,'#2a3547',()=>{ netLeave(true); state='menu'; });
+  drawButton('PLAY AGAIN',W/2,H*0.685,W*0.6,H*0.07,'#3a86c4',()=>{ netLeave(true); startMatch(); });
+  drawButton(stats.chests.length?'Open chests ('+stats.chests.length+')':'Chests',W/2,H*0.775,W*0.6,H*0.055,
+    stats.chests.length?'#8a6a12':'#2a3547',()=>{ netLeave(true); chestMsg=''; state='chests'; });
+  drawButton('Main menu',W/2,H*0.855,W*0.6,H*0.052,'#2a3547',()=>{ netLeave(true); state='menu'; });
 }
 
 /* --------------------------- DECK BUILDER -------------------------- */
@@ -1454,6 +1580,7 @@ function deckRects(){
   return rects;
 }
 function toggleDeckCard(k){
+  if(!isUnlocked(k)){ deckMsg='Locked — open chests to unlock this card'; return; }
   const d=stats.deck, i=d.indexOf(k);
   if(i>=0){ d.splice(i,1); deckMsg=''; }
   else if(d.length<8){ d.push(k); deckMsg=''; }
@@ -1533,7 +1660,7 @@ const GRACE_MS        = 6000;      // opponent disconnect grace period
 const Net = {
   ready:false, err:'', uid:null, db:null,
   on:false, role:null, myTeam:1, code:null,
-  roomRef:null, refs:[], status:'', foeDeck:null, foeSeen:0,
+  roomRef:null, refs:[], status:'', foeDeck:null, foeLv:null, foeSeen:0,
   desync:false, foeLeft:false, foeForfeit:false, lastSyncTick:0, sums:{}, seed:0,
   searching:false, queueRef:null,
 };
@@ -1590,7 +1717,7 @@ function netHost(){
     Net.roomRef=Net.db.ref('rooms/'+code);
     Net.roomRef.set({
       host:Net.uid, seed:Net.seed, createdAt:Date.now(), state:'waiting',
-      players:{ [Net.uid]:{ role:'host', deck:stats.deck, ts:Date.now() } }
+      players:{ [Net.uid]:{ role:'host', deck:stats.deck, lv:myLevels(), ts:Date.now() } }
     }).then(()=>{
       Net.roomRef.child('players/'+Net.uid).onDisconnect().update({gone:true});
       Net.status='Waiting for opponent…';
@@ -1614,9 +1741,10 @@ function netJoin(code){
       Net.seed=v.seed>>>0; Net.roomRef=ref;
       const hostEntry=v.players&&v.players[v.host];
       Net.foeDeck=(hostEntry&&hostEntry.deck)||DEFAULT_DECK.slice();
+      Net.foeLv=(hostEntry&&hostEntry.lv)||{};
       return ref.update({
         guest:Net.uid,
-        ['players/'+Net.uid]:{ role:'guest', deck:stats.deck, ts:Date.now() }
+        ['players/'+Net.uid]:{ role:'guest', deck:stats.deck, lv:myLevels(), ts:Date.now() }
       }).then(()=>{
         ref.child('players/'+Net.uid).onDisconnect().update({gone:true});
         Net.status='Connected — starting…';
@@ -1639,6 +1767,7 @@ function netWatchRoom(){
       return;
     }
     if(foe.deck) Net.foeDeck=foe.deck;
+    if(foe.lv) Net.foeLv=foe.lv;
     if(!Net.on && Net.foeDeck) netBegin();
   });
   netTrack(ref.child('cmds'),'child_added',snap=>{
@@ -1659,7 +1788,9 @@ function netBegin(){
   INPUT_DELAY=NET_DELAY_TICKS;
   Net.status='';
   const myDeck=stats.deck.slice(), foe=(Net.foeDeck||DEFAULT_DECK).slice();
-  startMatch(Net.seed, Net.role==='host'?myDeck:foe, Net.role==='host'?foe:myDeck);
+  const myLv=myLevels(), foeLv=Net.foeLv||{};
+  const host=Net.role==='host';
+  startMatch(Net.seed, host?myDeck:foe, host?foe:myDeck, host?myLv:foeLv, host?foeLv:myLv);
 }
 /* ---- quick match queue ---- */
 function netQuick(){
@@ -1698,7 +1829,7 @@ function netQuick(){
         Net.roomRef=Net.db.ref('rooms/'+code);
         Net.roomRef.set({
           host:Net.uid, seed:Net.seed, createdAt:Date.now(), state:'waiting',
-          players:{ [Net.uid]:{ role:'host', deck:stats.deck, ts:Date.now() } }
+          players:{ [Net.uid]:{ role:'host', deck:stats.deck, lv:myLevels(), ts:Date.now() } }
         }).then(()=>{
           Net.roomRef.child('players/'+Net.uid).onDisconnect().update({gone:true});
           // advertise on MY OWN ticket — writing the opponent's node is denied by rules
@@ -1746,6 +1877,176 @@ function MYTEAM(){ return Net.on ? Net.myTeam : 1; }
 function mySide(){ return MYTEAM()===1 ? player : enemy; }
 function foeSide(){ return MYTEAM()===1 ? enemy : player; }
 
+
+/* ------------------------ CHESTS & COLLECTION ---------------------- */
+let chestOpen=null, chestT=0, chestMsg='', colScroll=0;
+function drawChestIcon(cx,cy,r,tier,openAmt){
+  const c=CHESTS[tier], dk=shade(c.color,0.6), lt=shade(c.color,1.25);
+  ctx.save(); ctx.translate(cx,cy);
+  ctx.fillStyle='rgba(0,0,0,0.28)';
+  ctx.beginPath(); ctx.ellipse(0,r*0.92,r*0.95,r*0.22,0,0,7); ctx.fill();
+  ctx.fillStyle=dk; rr(ctx,-r*0.8,-r*0.1,r*1.6,r*0.95,r*0.12); ctx.fill();
+  ctx.fillStyle=c.color; rr(ctx,-r*0.7,0,r*1.4,r*0.78,r*0.1); ctx.fill();
+  const lid=-(openAmt||0)*r*0.9;
+  ctx.save(); ctx.translate(0,lid);
+  ctx.fillStyle=dk;
+  ctx.beginPath(); ctx.moveTo(-r*0.82,-r*0.08);
+  ctx.quadraticCurveTo(0,-r*0.95,r*0.82,-r*0.08); ctx.closePath(); ctx.fill();
+  ctx.fillStyle=lt;
+  ctx.beginPath(); ctx.moveTo(-r*0.68,-r*0.12);
+  ctx.quadraticCurveTo(0,-r*0.8,r*0.68,-r*0.12); ctx.closePath(); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle='#f2c33c'; rr(ctx,-r*0.16,-r*0.16,r*0.32,r*0.5,r*0.06); ctx.fill();
+  ctx.fillStyle='#8a6a12'; ctx.beginPath(); ctx.arc(0,r*0.06,r*0.09,0,7); ctx.fill();
+  ctx.restore();
+}
+function goldLine(y){
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle='#f2c33c'; ctx.font=`bold ${Math.round(Math.min(W,H)*0.034)}px system-ui`;
+  ctx.fillText('◉ '+(stats.gold||0)+' gold',W/2,y);
+}
+function chestSlotRects(){
+  const n=MAX_CHESTS, cols=3, out=[];
+  const cw=W*0.26, ch=cw*0.86, pad=W*0.03;
+  const gw=cols*cw+pad*(cols-1), x0=(W-gw)/2, y0=H*0.24;
+  for(let i=0;i<n;i++){
+    const r=Math.floor(i/cols), c=i%cols;
+    out.push({x:x0+c*(cw+pad), y:y0+r*(ch+pad), w:cw, h:ch, i});
+  }
+  return out;
+}
+function drawChests(){
+  ctx.fillStyle='rgba(5,8,14,0.96)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle='#ffd23c'; ctx.font=`bold ${Math.round(Math.min(W,H)*0.055)}px "Trebuchet MS",system-ui`;
+  ctx.fillText('CHESTS',W/2,H*0.075);
+  goldLine(H*0.135);
+  ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.026)}px system-ui`;
+  ctx.fillText(stats.chests.length?'Tap a chest to open it':'Win matches to earn chests — more crowns, better chest',W/2,H*0.19);
+
+  buttons=[];
+  for(const r of chestSlotRects()){
+    const tier=stats.chests[r.i];
+    ctx.fillStyle=tier?'rgba(255,255,255,0.06)':'rgba(255,255,255,0.03)';
+    rr(ctx,r.x,r.y,r.w,r.h,10); ctx.fill();
+    ctx.strokeStyle=tier?CHESTS[tier].color:'rgba(255,255,255,0.10)';
+    ctx.lineWidth=tier?2.5:1.5; rr(ctx,r.x,r.y,r.w,r.h,10); ctx.stroke();
+    if(tier){
+      drawChestIcon(r.x+r.w/2,r.y+r.h*0.44,r.w*0.30,tier,0);
+      ctx.fillStyle=CHESTS[tier].color; ctx.font=`bold ${Math.round(r.h*0.13)}px system-ui`;
+      ctx.fillText(CHESTS[tier].name.replace(' Chest',''),r.x+r.w/2,r.y+r.h*0.85);
+    } else {
+      ctx.fillStyle='rgba(255,255,255,0.16)'; ctx.font=`600 ${Math.round(r.h*0.30)}px system-ui`;
+      ctx.fillText('+',r.x+r.w/2,r.y+r.h/2);
+    }
+  }
+  if(chestMsg){ ctx.fillStyle='#ff9a6a'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.027)}px system-ui`;
+    ctx.fillText(chestMsg,W/2,H*0.60); }
+
+  ctx.fillStyle='rgba(255,255,255,0.55)'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.028)}px system-ui`;
+  ctx.fillText('Shop',W/2,H*0.655);
+  const tiers=['wood','silver','gold'];
+  tiers.forEach((t,i)=>{
+    const c=CHESTS[t], afford=(stats.gold||0)>=c.cost;
+    drawButton(c.name.replace(' Chest','')+'  ◉'+c.cost, W*(0.19+i*0.31), H*0.725, W*0.29, H*0.058,
+      afford?'#3d4a5e':'#2a3040', ()=>{ const e=buyChest(t); chestMsg=e||''; }, afford?c.color:null);
+  });
+  drawButton('Collection',W/2,H*0.83,W*0.62,H*0.062,'#3a86c4',()=>{ state='collection'; });
+  drawButton('Back',W/2,H*0.91,W*0.5,H*0.055,'#2a3547',()=>{ chestMsg=''; state='menu'; });
+}
+function drawChestOpen(){
+  ctx.fillStyle='rgba(5,8,14,0.97)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  const o=chestOpen, k=Math.min(1,chestT/0.6);
+  const c=CHESTS[o.tier];
+  ctx.fillStyle=c.color; ctx.font=`bold ${Math.round(Math.min(W,H)*0.05)}px "Trebuchet MS",system-ui`;
+  ctx.fillText(c.name,W/2,H*0.10);
+  const bob=Math.sin(chestT*6)*(1-k)*Math.min(W,H)*0.012;
+  drawChestIcon(W/2,H*0.235+bob,Math.min(W,H)*0.085,o.tier,k);
+  if(k>=1){
+    for(let i=0;i<8;i++){ const a=i/8*6.28+chestT;
+      ctx.globalAlpha=0.25; ctx.fillStyle=c.color;
+      ctx.beginPath(); ctx.arc(W/2+Math.cos(a)*Math.min(W,H)*0.11,H*0.235+Math.sin(a)*Math.min(W,H)*0.06,3,0,7); ctx.fill();
+      ctx.globalAlpha=1; }
+  }
+  let y=H*0.37;
+  if(chestT>0.5){
+    ctx.fillStyle='#f2c33c'; ctx.font=`bold ${Math.round(Math.min(W,H)*0.045)}px system-ui`;
+    ctx.fillText('◉ +'+o.gold+' gold',W/2,y); y+=H*0.055;
+  }
+  const keys=Object.keys(o.cards);
+  keys.forEach((ck,i)=>{
+    if(chestT < 0.75+i*0.18) return;
+    const isNew=o.unlocked.indexOf(ck)>=0, up=o.levelUps[ck];
+    const rowH=Math.min(W,H)*0.052, iconR=rowH*0.44;
+    ctx.textAlign='left';
+    drawCardIcon(CARDS[ck],W*0.20,y,iconR);
+    ctx.fillStyle=isNew?'#ffd23c':'#fff'; ctx.font=`bold ${Math.round(rowH*0.46)}px system-ui`;
+    ctx.fillText(CARDS[ck].name,W*0.28,y-rowH*0.16);
+    ctx.fillStyle=isNew?'#ffd23c':'rgba(255,255,255,0.6)'; ctx.font=`600 ${Math.round(rowH*0.38)}px system-ui`;
+    ctx.fillText(isNew?'NEW CARD UNLOCKED!':('×'+o.cards[ck]+(up?'   ▲ Level '+cardLevel(ck):'')),W*0.28,y+rowH*0.30);
+    ctx.textAlign='center';
+    y+=rowH*1.25;
+  });
+  buttons=[];
+  if(chestT>0.75+keys.length*0.18){
+    drawButton('Collect',W/2,H*0.90,W*0.6,H*0.07,'#2f7d4f',()=>{ chestOpen=null; chestMsg=''; state='chests'; });
+  }
+}
+function collectionRects(){
+  const cols=4, pad=W*0.02, top=H*0.20;
+  let cw=(W-pad*(cols+1))/cols, ch=cw*1.34;
+  const out=[];
+  POOL.forEach((k,i)=>{
+    const r=Math.floor(i/cols), c=i%cols;
+    out.push({x:pad+c*(cw+pad), y:top+r*(ch+pad*1.6)-colScroll, w:cw, h:ch, key:k});
+  });
+  return out;
+}
+function drawCollection(){
+  ctx.fillStyle='rgba(5,8,14,0.97)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  const rects=collectionRects();
+  for(const r of rects){
+    if(r.y+r.h<H*0.17||r.y>H*0.87) continue;
+    const k=r.key, c=CARDS[k], on=isUnlocked(k), lv=cardLevel(k);
+    ctx.save();
+    if(!on) ctx.globalAlpha=0.30;
+    drawCardFace(c,r,true,false);
+    ctx.restore();
+    if(on){
+      ctx.fillStyle='rgba(10,14,22,0.78)';
+      rr(ctx,r.x+2,r.y+2,r.w*0.40,r.h*0.15,4); ctx.fill();
+      ctx.fillStyle=lv>=LV_MAX?'#ffd23c':'#fff'; ctx.font=`bold ${Math.round(r.h*0.115)}px system-ui`;
+      ctx.fillText('L'+lv,r.x+2+r.w*0.20,r.y+2+r.h*0.075);
+      const need=copiesNeeded(lv), have=stats.copies[k]||0;
+      const bw=r.w-8, bx=r.x+4, by=r.y+r.h-r.h*0.13, bh=r.h*0.075;
+      ctx.fillStyle='rgba(0,0,0,0.55)'; rr(ctx,bx,by,bw,bh,3); ctx.fill();
+      if(lv<LV_MAX){
+        ctx.fillStyle='#4fa3ff'; rr(ctx,bx,by,bw*clamp(have/need,0,1),bh,3); ctx.fill();
+        ctx.fillStyle='rgba(255,255,255,0.9)'; ctx.font=`bold ${Math.round(bh*0.95)}px system-ui`;
+        ctx.fillText(have+'/'+need,r.x+r.w/2,by+bh/2);
+      } else {
+        ctx.fillStyle='#ffd23c'; rr(ctx,bx,by,bw,bh,3); ctx.fill();
+        ctx.fillStyle='#3a2c00'; ctx.font=`bold ${Math.round(bh*0.95)}px system-ui`;
+        ctx.fillText('MAX',r.x+r.w/2,by+bh/2);
+      }
+    } else {
+      ctx.fillStyle='rgba(0,0,0,0.55)'; rr(ctx,r.x,r.y,r.w,r.h,10); ctx.fill();
+      ctx.fillStyle='rgba(255,255,255,0.75)'; ctx.font=`bold ${Math.round(r.h*0.26)}px system-ui`;
+      ctx.fillText('🔒',r.x+r.w/2,r.y+r.h/2);
+    }
+  }
+  ctx.fillStyle='rgba(5,8,14,0.97)'; ctx.fillRect(0,0,W,H*0.17);
+  ctx.fillStyle='#ffd23c'; ctx.font=`bold ${Math.round(Math.min(W,H)*0.05)}px "Trebuchet MS",system-ui`;
+  ctx.fillText('COLLECTION',W/2,H*0.065);
+  const have=stats.unlocked.length;
+  ctx.fillStyle='rgba(255,255,255,0.6)'; ctx.font=`600 ${Math.round(Math.min(W,H)*0.03)}px system-ui`;
+  ctx.fillText(have+' / '+POOL.length+' cards unlocked   ·   ◉ '+(stats.gold||0),W/2,H*0.12);
+  ctx.fillStyle='rgba(5,8,14,0.97)'; ctx.fillRect(0,H*0.87,W,H*0.13);
+  buttons=[];
+  drawButton('Back',W/2,H*0.93,W*0.5,H*0.058,'#2a3547',()=>{ colScroll=0; state='chests'; });
+}
 
 /* ---------------------------- ONLINE UI ---------------------------- */
 let joinBuf='';
@@ -1896,6 +2197,26 @@ function onDown(e){
     for(const r of deckRects()){ if(inRect(p,r)){ toggleDeckCard(r.key); return; } }
     return;
   }
+  if(state==='chests'){
+    for(const b of buttons){ if(inRect(p,b)){ b.onClick(); return; } }
+    for(const r of chestSlotRects()){
+      if(inRect(p,r)&&stats.chests[r.i]){
+        const tier=stats.chests.splice(r.i,1)[0];
+        chestOpen=openChest(tier); chestT=0; state='chestopen';
+        beep(520,0.12,'triangle',0.07); setTimeout(()=>beep(780,0.18,'triangle',0.06),140);
+        return;
+      }
+    }
+    return;
+  }
+  if(state==='chestopen'){
+    for(const b of buttons){ if(inRect(p,b)){ b.onClick(); return; } }
+    return;
+  }
+  if(state==='collection'){
+    for(const b of buttons){ if(inRect(p,b)){ b.onClick(); return; } }
+    dragging=true; drag=p; return;
+  }
   if(state==='netjoin'){
     for(const b of buttons){ if(inRect(p,b)){ b.onClick(); return; } }
     if(joinBuf.length<4) for(const k of keyRects()){
@@ -1917,8 +2238,13 @@ function onDown(e){
     return; } }
   if(sel>=0&&p.y<H-HUD_H){ dragging=true; drag=p; }
 }
-function onMove(e){ if(!dragging) return; e.preventDefault(); drag=evPos(e); }
+function onMove(e){
+  if(state==='collection'&&dragging){ e.preventDefault();
+    const p=evPos(e); colScroll=clamp(colScroll+(drag.y-p.y),0,Math.max(0,H*0.55)); drag=p; return; }
+  if(!dragging) return; e.preventDefault(); drag=evPos(e);
+}
 function onUp(e){
+  if(state==='collection'){ dragging=false; return; }
   if(state!=='playing'||!dragging) return;
   const p=drag; dragging=false;
   if(p.y<H-HUD_H&&sel>=0) tryDeploy(p.x,p.y);
@@ -1935,6 +2261,7 @@ function loop(ts){
   now=ts;
   let frame=(ts-last)/1000; last=ts;
   if(frame>0.25) frame=0.25; if(frame<0) frame=0;
+  if(state==='chestopen') chestT+=frame;
   acc+=frame;
   let guard=0;
   while(acc>=STEP&&guard<5){ update(STEP); acc-=STEP; guard++; }
