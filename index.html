@@ -42,7 +42,7 @@ const RIVER = 14;
 const BR_L = 4, BR_R = 14;
 const BRIDGE_HALF = 0.62;             // half-width of walkable bridge deck
 const MATCH_LEN = 150, DOUBLE_AT = 40, OVERTIME = 60;
-const GAME_VERSION = '2.1';
+const GAME_VERSION = '2.1.1';
 const STEP = 1/60;
 /* Deploy delay scales with card weight: cheap cycle cards land fast,
    heavy tanks telegraph. Per-card `deploy` overrides this fallback. */
@@ -781,6 +781,7 @@ function steerUnit(u,dt){
   let sepx=0, sepy=0, n=0;
   forEachNeighbor(u,o=>{
     if(o===u||o.dead||o.air!==u.air) return;
+    if(o===u.target) return;              // never get pushed away from what you're attacking
     const ddx=u.x-o.x, ddy=u.y-o.y;
     const dd=len2(ddx,ddy);
     const mind=(u.radius+o.radius)*1.06;
@@ -791,9 +792,10 @@ function steerUnit(u,dt){
   });
   if(n){ sepx/=n; sepy/=n; }
 
-  // bridge funnel: near the river, steer toward the bridge centre line
+  // bridge funnel — ONLY while a crossing is still required. Applying it to a
+  // unit already on the target's side fights the seek force and can pin it.
   let fnx=0;
-  if(!u.air){
+  if(!u.air && (u.y<RIVER)!==(t.y<RIVER)){
     const band=Math.abs(u.y-RIVER);
     if(band<2.6){
       const bx=nearestBridge(u.x);
